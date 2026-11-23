@@ -122,6 +122,7 @@ class Config:
         self.default_route = dr
         self.connect_timeout = float(env("CONNECT_TIMEOUT", "15"))
         self.refresh_secs = float(env("REFRESH_SECS", "5"))
+        self.relay_idle_timeout = float(env("RELAY_IDLE_TIMEOUT", "300"))
 
     def decide(self, host):
         host = host.lower().rstrip(".")
@@ -379,8 +380,19 @@ class Resolver:
     def __init__(self, state):
         self.state = state
         self.cache = {}  # (host, route) -> (ips, expiry)
+        self._last_prune = 0.0
+
+    def _prune(self):
+        now = time.time()
+        if now - self._last_prune < 60:
+            return
+        self._last_prune = now
+        expired = [k for k, (_, exp) in self.cache.items() if exp <= now]
+        for k in expired:
+            del self.cache[k]
 
     async def resolve(self, host, route):
+        self._prune()
         try:
             ipaddress.ip_address(host)
             return [host]
@@ -406,8 +418,11 @@ class Resolver:
             log.warning("dns %s via %s(%s) failed (%s); falling back to system resolver", host, route, ifname, errstr(last_err))
         loop = asyncio.get_running_loop()
         try:
-            infos = await loop.getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
-        except socket.gaierror as e:
+            infos = await asyncio.wait_for(
+                loop.getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_STREAM),
+                10,
+            )
+        except (socket.gaierror, asyncio.TimeoutError) as e:
             raise DNSError(str(e)) from e
         ips = list(dict.fromkeys(i[4][0] for i in infos))
         if not ips:
@@ -442,16 +457,15 @@ class Proxy:
         log.warning("%s %s:%d -> %s(%s) FAILED: %s", via, host, port, route, ifname or "unbound", errstr(last_err))
         raise last_err or OSError("connect failed")
 
-    @staticmethod
-    async def _pipe(reader, writer):
+    async def _pipe(self, reader, writer, sibling_reader):
         try:
             while True:
-                data = await reader.read(65536)
+                data = await asyncio.wait_for(reader.read(65536), self.cfg.relay_idle_timeout)
                 if not data:
                     break
                 writer.write(data)
                 await writer.drain()
-        except (ConnectionError, asyncio.IncompleteReadError, OSError):
+        except (ConnectionError, asyncio.IncompleteReadError, OSError, asyncio.TimeoutError):
             pass
         finally:
             try:
@@ -459,16 +473,21 @@ class Proxy:
                     writer.write_eof()
             except Exception:
                 pass
+            try:
+                sibling_reader.feed_eof()
+            except Exception:
+                pass
 
     async def relay(self, r1, w1, r2, w2):
         self.active += 1
         try:
-            await asyncio.gather(self._pipe(r1, w2), self._pipe(r2, w1))
+            await asyncio.gather(self._pipe(r1, w2, r2), self._pipe(r2, w1, r1))
         finally:
             self.active -= 1
             for w in (w1, w2):
                 try:
                     w.close()
+                    await asyncio.wait_for(w.wait_closed(), 5)
                 except Exception:
                     pass
 
@@ -618,6 +637,15 @@ class Proxy:
                 log.warning("interface refresh failed: %r", e)
             await asyncio.sleep(self.cfg.refresh_secs)
 
+    def _restart_refresher(self, task):
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            log.warning("refresher task crashed: %r", exc)
+        self._refresher_task = asyncio.create_task(self.refresher())
+        self._refresher_task.add_done_callback(self._restart_refresher)
+
     async def serve(self):
         self.state.refresh()
         hh, hp = self.cfg.http_listen.rsplit(":", 1)
@@ -630,7 +658,8 @@ class Proxy:
                  self.cfg.default_route,
                  ", ".join(r.text for r in self.cfg.vpn_rules) or "-",
                  ", ".join(r.text for r in self.cfg.direct_rules) or "-")
-        asyncio.create_task(self.refresher())
+        self._refresher_task = asyncio.create_task(self.refresher())
+        self._refresher_task.add_done_callback(self._restart_refresher)
         async with http_srv, socks_srv:
             await asyncio.gather(http_srv.serve_forever(), socks_srv.serve_forever())
 

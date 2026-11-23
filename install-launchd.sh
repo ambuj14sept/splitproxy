@@ -36,6 +36,15 @@ cat > "$PLIST" <<PL
   <key>StandardErrorPath</key><string>$RUNTIME/logs/splitproxy.log</string>
 </dict></plist>
 PL
+# bootout returns before the job is fully gone; bootstrapping too early fails
+# with "Bootstrap failed: 5: Input/output error". Wait for it to disappear.
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+for _ in $(seq 1 50); do
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
+  sleep 0.2
+done
+if ! launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then
+  # Still loaded: restart it in place so it re-reads the copied .env.
+  launchctl kickstart -k "gui/$(id -u)/$LABEL"
+fi
 echo "installed $LABEL (runtime: $RUNTIME, log: $RUNTIME/logs/splitproxy.log)"

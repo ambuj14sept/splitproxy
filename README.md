@@ -96,6 +96,7 @@ macOS does not let launchd run jobs out of `~/Desktop`, `~/Documents` or
 | `HTTP_LISTEN`   | `127.0.0.1:8080`     | HTTP/HTTPS proxy address. |
 | `SOCKS_LISTEN`  | `127.0.0.1:1080`     | SOCKS5 proxy address. |
 | `LOG_LEVEL`     | `INFO`               | `DEBUG` for handler errors. |
+| `RELAY_IDLE_TIMEOUT` | `300`          | Seconds without data before an idle relay is closed. Lower to reap zombies faster. |
 
 Most-specific rule wins (`bitbucket.juspay.net` beats `*.juspay.net`); on a
 tie, VPN wins. Flip `DEFAULT_ROUTE=vpn` and list only the sites you want
